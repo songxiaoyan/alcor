@@ -45,39 +45,33 @@ public class GoalStateClientImpl implements GoalStateClient {
     }
 
     @Override
-    public List<String> sendGoalStates(Map<String, HostGoalState> hostGoalStates) throws Exception {
-        List<Future<HostGoalState>>
+    public Map<String, List<Goalstateprovisioner.GoalStateOperationReply.GoalStateOperationStatus>> sendGoalStates(Map<String, HostGoalState> hostGoalStates) throws Exception {
+        List<Future<Map<String, List<Goalstateprovisioner.GoalStateOperationReply.GoalStateOperationStatus>>>>
                 futures = new ArrayList<>(hostGoalStates.size());
+        Map<String, List<Goalstateprovisioner.GoalStateOperationReply.GoalStateOperationStatus>> result = new HashMap<>();
 
         for (HostGoalState hostGoalState : hostGoalStates.values()) {
-            Future<HostGoalState> future =
+            Future<Map<String, List<Goalstateprovisioner.GoalStateOperationReply.GoalStateOperationStatus>>> future =
                     executor.submit(() -> {
                         try {
-                            doSendGoalState(hostGoalState);
+                            return doSendGoalState(hostGoalState);
                         } catch (InterruptedException e) {
                             e.printStackTrace();
-                            return hostGoalState;
+                            return Collections.emptyMap();
                         }
-
-                        return new HostGoalState();
                     });
-
             futures.add(future);
         }
 
         //Handle all failed hosts
-        return futures.parallelStream().filter(Objects::nonNull).map(future -> {
-            try {
-                return future.get().getHostIp();
-            } catch (InterruptedException | ExecutionException e) {
-                e.printStackTrace();
-            }
+        for (Future<Map<String, List<Goalstateprovisioner.GoalStateOperationReply.GoalStateOperationStatus>>> future : futures) {
+            result.putAll(future.get());
+        }
 
-            return null;
-        }).collect(Collectors.toList());
+        return result;
     }
 
-    private void doSendGoalState(HostGoalState hostGoalState) throws InterruptedException {
+    private Map<String, List<Goalstateprovisioner.GoalStateOperationReply.GoalStateOperationStatus>> doSendGoalState(HostGoalState hostGoalState) throws InterruptedException {
 
         String hostIp = hostGoalState.getHostIp();
         Goalstate.GoalStateV2 goalState = hostGoalState.getGoalState();
@@ -89,16 +83,16 @@ public class GoalStateClientImpl implements GoalStateClient {
                 .build();
         GoalStateProvisionerGrpc.GoalStateProvisionerStub stub = GoalStateProvisionerGrpc.newStub(channel);
 
-        StreamObserver<Goalstateprovisioner.GoalStateOperationReply> observer = new StreamObserver<Goalstateprovisioner.GoalStateOperationReply>() {
+        StreamObserver<Goalstate.GoalStateV2> stateV2StreamObserver = stub.pushGoalStatesStream(new StreamObserver<>() {
             @Override
-            public void onNext(Goalstateprovisioner.GoalStateOperationReply value) {
-//                stub.pushGoalStatesStream(value);
-//                List<Goalstateprovisioner.GoalStateOperationReply.GoalStateOperationStatus> statuses =
-//                        reply.getOperationStatusesList();
+            public void onNext(Goalstateprovisioner.GoalStateOperationReply goalStateOperationReply) {
+                List<Goalstateprovisioner.GoalStateOperationReply.GoalStateOperationStatus> operationStatusesList
+                        = goalStateOperationReply.getOperationStatusesList();
+                result.put(hostIp, operationStatusesList);
             }
 
             @Override
-            public void onError(Throwable t) {
+            public void onError(Throwable throwable) {
 
             }
 
@@ -106,11 +100,13 @@ public class GoalStateClientImpl implements GoalStateClient {
             public void onCompleted() {
 
             }
-        };
+        });
 
-//        result.put(hostIp, statuses);
+        stateV2StreamObserver.onNext(goalState);
+        stateV2StreamObserver.onCompleted();
 
         shutdown(channel);
+        return result;
     }
 
     private void shutdown(ManagedChannel channel) {

@@ -1,24 +1,30 @@
 package com.futurewei.alcor.netwconfigmanager.server.grpc;
 
+import com.futurewei.alcor.common.db.CacheException;
 import com.futurewei.alcor.common.logging.Logger;
 import com.futurewei.alcor.common.logging.LoggerFactory;
 import com.futurewei.alcor.netwconfigmanager.client.GoalStateClient;
 import com.futurewei.alcor.netwconfigmanager.client.gRPC.GoalStateClientImpl;
 import com.futurewei.alcor.netwconfigmanager.config.Config;
 import com.futurewei.alcor.netwconfigmanager.entity.HostGoalState;
+import com.futurewei.alcor.netwconfigmanager.repo.NetworkConfigRepo;
 import com.futurewei.alcor.netwconfigmanager.server.NetworkConfigServer;
 import com.futurewei.alcor.netwconfigmanager.util.NetworkConfigManagerUtil;
 import com.futurewei.alcor.schema.*;
 import io.grpc.stub.StreamObserver;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import lombok.SneakyThrows;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
+import java.util.stream.Collectors;
 
 @Service
 public class GoalStateProvisionerServer implements NetworkConfigServer {
@@ -28,8 +34,8 @@ public class GoalStateProvisionerServer implements NetworkConfigServer {
     private final int port;
     private final Server server;
 
-//    @Autowired
-//    private GoalStateClient grpcGoalStateClient;
+    @Autowired
+    private NetworkConfigRepo networkConfigRepo;
 
     public GoalStateProvisionerServer() {
         this.port = 50010;
@@ -73,7 +79,7 @@ public class GoalStateProvisionerServer implements NetworkConfigServer {
         }
     }
 
-    private static class GoalStateProvisionerImpl extends GoalStateProvisionerGrpc.GoalStateProvisionerImplBase {
+    private class GoalStateProvisionerImpl extends GoalStateProvisionerGrpc.GoalStateProvisionerImplBase {
 
         GoalStateProvisionerImpl() { }
 
@@ -81,6 +87,7 @@ public class GoalStateProvisionerServer implements NetworkConfigServer {
         public StreamObserver<Goalstate.GoalStateV2> pushGoalStatesStream(final StreamObserver<Goalstateprovisioner.GoalStateOperationReply> responseObserver) {
 
             return new StreamObserver<Goalstate.GoalStateV2>() {
+                @SneakyThrows
                 @Override
                 public void onNext(Goalstate.GoalStateV2 value) {
 
@@ -90,11 +97,13 @@ public class GoalStateProvisionerServer implements NetworkConfigServer {
                     Map<String, HostGoalState> hostGoalStates = NetworkConfigManagerUtil.splitClusterToHostGoalState(value);
 
                     //store the goal state in cache
+                    saveGoalStateInDB(hostGoalStates);
 
                     //send them down to target ACA
                     try {
                         GoalStateClient grpcGoalStateClient = new GoalStateClientImpl();
-                        grpcGoalStateClient.sendGoalStates(hostGoalStates);
+                        Map<String, List<Goalstateprovisioner.GoalStateOperationReply.GoalStateOperationStatus>> goalStateReplyMap
+                                = grpcGoalStateClient.sendGoalStates(hostGoalStates);
                     } catch (Exception e) {
                         e.printStackTrace();
                     }
@@ -120,6 +129,51 @@ public class GoalStateProvisionerServer implements NetworkConfigServer {
                     responseObserver.onCompleted();
                 }
             };
+        }
+    }
+
+    private void saveGoalStateInDB(Map<String, HostGoalState> hostGoalStates) throws CacheException {
+        for (Map.Entry<String, HostGoalState> goalStateEntry : hostGoalStates.entrySet()) {
+            String hostId = goalStateEntry.getKey();
+            HostGoalState goalState = goalStateEntry.getValue();
+            List<Goalstate.ResourceIdType> hostResources = goalState.getGoalState().getHostResourcesMap()
+                    .get(hostId).getResourcesList();
+            ArrayList<String> resourceIdList = hostResources.stream().map(Goalstate.ResourceIdType::getId)
+                    .collect(Collectors.toCollection(ArrayList::new));
+            networkConfigRepo.addListResourceIdItem(hostId,resourceIdList);
+
+            for (Goalstate.ResourceIdType hostResource : hostResources) {
+                String resourceId = hostResource.getId();
+                Common.ResourceType type = hostResource.getType();
+                switch (type) {
+                    case VPC:
+                        networkConfigRepo.addResourceStateItem(resourceId, goalState.getGoalState().getVpcStatesMap().get(resourceId));
+                        break;
+                    case SUBNET:
+                        networkConfigRepo.addResourceStateItem(resourceId, goalState.getGoalState().getSubnetStatesMap().get(resourceId));
+                        break;
+                    case PORT:
+                        networkConfigRepo.addResourceStateItem(resourceId, goalState.getGoalState().getPortStatesMap().get(resourceId));
+                        break;
+                    case NEIGHBOR:
+                        networkConfigRepo.addResourceStateItem(resourceId, goalState.getGoalState().getNeighborStatesMap().get(resourceId));
+                        break;
+                    case SECURITYGROUP:
+                        networkConfigRepo.addResourceStateItem(resourceId, goalState.getGoalState().getSecurityGroupStatesMap().get(resourceId));
+                        break;
+                    case DHCP:
+                        networkConfigRepo.addResourceStateItem(resourceId, goalState.getGoalState().getDhcpStatesMap().get(resourceId));
+                        break;
+                    case ROUTER:
+                        networkConfigRepo.addResourceStateItem(resourceId, goalState.getGoalState().getRouterStatesMap().get(resourceId));
+                        break;
+                    case GATEWAY:
+                        networkConfigRepo.addResourceStateItem(resourceId, goalState.getGoalState().getGatewayStatesMap().get(resourceId));
+                        break;
+                    case UNRECOGNIZED:
+                        break;
+                }
+            }
         }
     }
 }
